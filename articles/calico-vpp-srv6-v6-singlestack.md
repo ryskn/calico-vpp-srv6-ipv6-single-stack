@@ -363,9 +363,9 @@ subjects:
   namespace: calico-vpp-dataplane
 ```
 
-### 7-5. image-patch.yaml (自作 image を指定)
+### 7-5. image-patch.yaml (fix 入り image を指定)
 
-PR #973 の fix が入った自作 image を使うので `imagePullPolicy: Never` で registry バイパスする:
+PR #973 と PR #982 の fix を両方含んだ image を GHCR に push 済みなので、それを直接 pull する。tag は commit SHA を使う:
 
 ```yaml
 apiVersion: apps/v1
@@ -378,12 +378,20 @@ spec:
     spec:
       containers:
       - name: vpp
-        image: calicovpp/vpp:srv6-fix
-        imagePullPolicy: Never
+        image: ghcr.io/ryskn/calicovpp/vpp:beb8ef38bcacae9caa4369d514c637587ca5ac28
+        imagePullPolicy: IfNotPresent
       - name: agent
-        image: calicovpp/agent:srv6-fix
-        imagePullPolicy: Never
+        image: ghcr.io/ryskn/calicovpp/agent:beb8ef38bcacae9caa4369d514c637587ca5ac28
+        imagePullPolicy: IfNotPresent
 ```
+
+この image に含まれている fix:
+
+- **[PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)** (merged): SR Policy install を直す 3 件 — BSID の `anypb.Any` 2 段 Unmarshal、SR Policy SAFI (`85`) を受け付けるよう条件修正、`injectRoute` fallback の抑止
+- **[PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982)** (open): IPv6 single-stack で発生する cnat SNAT の ENOENT idempotency 問題のガード。`cnat_snat_policy_add_del_if(is_add=false)` が一度も add されていない family (= INCLUDE_V4 が空) で発火すると VPP API が `-6 No such entry` を返し、agent の reconcile loop が `dying` に入るのを防ぐ
+  - 根本修正は VPP 側で対応済み ([gerrit Change 45604](https://gerrit.fd.io/r/c/vpp/+/45604))。これがリリースに入るまでの暫定 guard
+
+multi-arch (amd64 / arm64) で push してあるので、x86 / ARM 両方の cluster で同じ tag を使える。
 
 ### 7-6. 生成と適用
 
@@ -392,33 +400,45 @@ kubectl kustomize yaml/overlays/dev-ryskn-srv6 > calico-vpp-srv6.yaml
 kubectl apply -f calico-vpp-srv6.yaml
 ```
 
-## 8. master ブランチから自作 VPP / Agent image をビルド
+## 8. fix 入り VPP / Agent image を入手する
 
-今回使うのは公式 release (v3.31.0) ではなく master ブランチのコード。release 版には SRv6 dataplane に 3 つの不具合があり、SR Policy が正しく install されない ([PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973) で修正):
+7-5 で指定した image は **公式 release (v3.31.x) ではなく** PR #973 + PR #982 を当てたもの。release 版には SRv6 dataplane の不具合 3 件 (BSID の 2 段 Unmarshal / SAFI `85` 未対応 / `injectRoute` fallback の干渉) と、IPv6 single-stack で agent を巻き込む cnat ENOENT があるため、そのままだと SR Policy が install されないか、再起動時に agent が落ちる。
 
-1. BGP の `TunnelEncapSubTLV` 内の BSID が `anypb.Any` で 2 段 wrap されていて、1 段目の Unmarshal だけだと SR Binding SID を取り出せない
-2. SR Policy Add ハンドラの SAFI 条件が VPN-v6 (`128`) しかマッチせず、本来使う SR Policy SAFI (`85`) を落としていた
-3. `injectRoute` のフォールバックが SR Policy 受信後の encap route install を阻害していた
+入手方法は 2 つある。
 
-### ビルド (amd64)
+### 8-a. GHCR から pull する (推奨)
 
-開発機で:
+7-5 の `image-patch.yaml` に書いた tag をそのまま使う。各ノードに事前 pull したい場合:
+
+```bash
+for h in 192.168.1.102 192.168.1.103 192.168.1.104; do
+    ssh root@$h '
+        podman pull ghcr.io/ryskn/calicovpp/vpp:beb8ef38bcacae9caa4369d514c637587ca5ac28
+        podman pull ghcr.io/ryskn/calicovpp/agent:beb8ef38bcacae9caa4369d514c637587ca5ac28
+    '
+done
+```
+
+`imagePullPolicy: IfNotPresent` にしているので、最初の Pod 起動時に kubelet が pull する。pre-pull はオフライン耐性が欲しいときだけで OK。
+
+GHCR public で配布しているので auth は不要。private にした場合は `imagePullSecret` を `calico-vpp-dataplane` namespace に置く必要がある。
+
+### 8-b. 自前で master ブランチからビルドする (代替)
+
+自分で fix を当て直したい / patch を変えたい場合はこちら。
 
 ```bash
 git clone https://github.com/projectcalico/vpp-dataplane.git
 cd vpp-dataplane
+# PR #982 を取り込む (まだ未 merge なので必要)
+git fetch origin pull/982/head:pr982
+git merge --no-edit pr982
 
 make -C vpp-manager vpp-image TAG=srv6-fix
 make -C calico-vpp-agent image TAG=srv6-fix
 ```
 
-成果物:
-- `calicovpp/vpp:srv6-fix`
-- `calicovpp/agent:srv6-fix`
-
-### 全ノードへ配布
-
-registry に push せず tarball で直接ロード:
+成果物 (`calicovpp/vpp:srv6-fix` / `calicovpp/agent:srv6-fix`) を tarball で配布:
 
 ```bash
 podman save -o /tmp/calicovpp-vpp-srv6-fix.tar calicovpp/vpp:srv6-fix
@@ -432,6 +452,8 @@ for h in 192.168.1.102 192.168.1.103 192.168.1.104; do
     '
 done
 ```
+
+この場合は 7-5 の `image-patch.yaml` を `image: calicovpp/vpp:srv6-fix` / `imagePullPolicy: Never` に書き戻す。
 
 ## 9. Calico 本体 image の配布
 
@@ -547,8 +569,12 @@ kubectl -n calico-vpp-dataplane exec -i $VPP -c agent -- gobgp neighbor
 - Pod IP は `fd20::/64` ではなく `fcff:0:0:<node>AA::/64` の LocalSID プールから割当される。これが SRv6 の native な設計 (Pod IP = End.DT6 SID)
 - BGP peer は node IP (v4) 経由の auto-mesh + VPP uplink の global v6 経由の両方が張られ、片方が落ちても経路配布が継続する
 - Proxmox vmbr0 の `multicast_snooping=1` は必ず落とす。落とさないと IPv6 ND が解けず、SRv6 encap 後のパケットが物理線に出ない
-- master ブランチの code ([PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)) を使う。release 版では SR Policy のインストールが壊れている
+- master ブランチの code ([PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)) + cnat ENOENT guard ([PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982)) を当てた image を使う。release 版では SR Policy のインストールが壊れているのに加え、v6 single-stack だと agent が `cnat_snat_policy_add_del_if` の ENOENT で reconcile loop ごと落ちる
 
 ---
 
-PR: [projectcalico/vpp-dataplane#973](https://github.com/projectcalico/vpp-dataplane/pull/973)
+PR / Change:
+
+- [projectcalico/vpp-dataplane#973](https://github.com/projectcalico/vpp-dataplane/pull/973) (merged) — SR Policy 受信周りの 3 件
+- [projectcalico/vpp-dataplane#982](https://github.com/projectcalico/vpp-dataplane/pull/982) — cnat SNAT ENOENT idempotent guard (暫定)
+- [VPP gerrit Change 45604](https://gerrit.fd.io/r/c/vpp/+/45604) — `cnat_snat_policy_entry` を `pool_get_zero` 直後に init して del-only 系列でも ENOENT を返さないようにする根本修正
