@@ -6,68 +6,79 @@ topics: ["kubernetes", "calico", "vpp", "srv6", "ipv6"]
 published: true
 ---
 
-Proxmox 上の 3 ノード VM (master×1, worker×2) に Calico-VPP の SRv6 データプレーンを IPv6 single-stack 構成でセットアップする手順。BGP peer は v4/v6 両方で冗長化する。
+Proxmox 上の 3 ノード VM (master×1, worker×2) に Calico-VPP の SRv6 データプレーンを IPv6 single-stack 構成でセットアップする手順。
 
-SRv6 は underlay が IPv6 前提なので、Pod / Service も v6 に揃えた方が自然に動く。前に dual-stack で組んだら cnat 経由の IPv4 Service が ~50% 通らず、v4 は実装の「おまけ」感が拭えなかったので、今回は単一 family に寄せる。
+SRv6 は underlay が IPv6 前提なので、Pod / Service も v6 に揃えた方が自然に動く。前に dual-stack で組んだら cnat 経由の IPv4 Service が通らなかったり、agent が cnat の ENOENT で落ちたりして、v4 は実装の「おまけ」感が拭えなかったので単一 family に寄せる。
+
+:::message
+**v3.32.0 で動くのは:** ここで書いた手順は Calico-VPP **v3.32.0** (= projectcalico/vpp-dataplane 公式 release) で動かしたもの。**fork build 不要** で公式 image (`docker.io/calicovpp/{vpp,agent}:v3.32.0`) で動く。それ以前の 3.31.x までは SRv6 install 周りの 3 件の不具合 ([PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)) と、v6 single-stack で agent が落ちる cnat ENOENT 問題 ([PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982) + [VPP gerrit Change 45604](https://gerrit.fd.io/r/c/vpp/+/45604)) があり、自前 image build が必要だった。v3.32.0 でこれらは全部 merged 済。
+:::
 
 ## 構成
 
-- **master-1**: 2 vCPU / 4 GB / NIC×1 (vmbr0), `192.168.1.102`
-- **worker-1, worker-2**: 4 vCPU / 8 GB / NIC×1 (vmbr0), `192.168.1.103`, `192.168.1.104`
+| Component | IPv4 (mgmt) | IPv6 ULA (k8s control-plane) |
+|---|---|---|
+| **infra01** (DNS / dnf-proxy) | 192.168.1.6 | (auto SLAAC) |
+| **master** | 192.168.1.10 | fd00:1::10 |
+| **worker-1** | 192.168.1.11 | fd00:1::11 |
+| **worker-2** | 192.168.1.12 | fd00:1::12 |
+
 - 管理 NW: `192.168.1.0/24` (IPv4)
-- IPv6 underlay: Proxmox host の RA 経由で `240b:…/64` SLAAC
-- DNS: `192.168.1.101` (内部 DNS)
-- ローカルリポジトリ: `http://local.repo.ryskn.k8s/` (RPM + image tarball)
-- Pod CIDR (kubeadm): `172.16.0.0/16,fd20::/64` (dual-stack で init、実割当は IPPool 側で v6 に制限)
-- Service CIDR (kubeadm): `10.96.0.0/12,fd30::/108`
+- IPv6 underlay: Proxmox host の RA 経由で `240b:…/64` SLAAC + 静的 ULA (`fd00:1::/64`) を eth0 に追加
+- 内部 DNS: infra01 上で **NSD (authoritative for `ryskn.k8s`)** + **unbound (recursive resolver)**
+- ローカル dnf proxy: infra01 上の nginx (`http://dnf-proxy.ryskn.k8s/almalinux/...`)
+- Pod CIDR: `fd20::/64` (Installation CR で IPPool として明示)
+- Service CIDR: `fd30::/108`
 - Pod 割当: **`fcff:0:0:<per-node>AA::/64` の LocalSID プール** (Pod IP = End.DT6 SID)
 
-:::message
-kubeadm init だけは dual-stack CIDR のままにする。v6 single-stack CIDR だと apiserver が「service CIDR の family と自ノード IP の family が一致しない」と言って起動しないため。実際の Pod 割当は IPPool で絞る。
-:::
+## なぜ IPv6 single-stack か
 
-## なぜ BGP peer を v4 と v6 両方張るのか
+cnat の IPv4 経路は IPv6 single-stack だと「INCLUDE_V4 が空」になり、agent reconcile loop で disable を投げると ENOENT で agent が落ちる ([PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982))。dual-stack でも cnat の IPv4 NAT は不安定で、Service の半数が通らないことがある。SRv6 は underlay が v6 前提なので、Pod / Service / control-plane を v6 に揃える方が trip-wire が減る。
 
-- v4 peer: kernel netns 側の link-local 問題で失敗しがちだった v6 peer が落ちても、経路配布が止まらない冗長経路として機能する。node IP が v4 なので auto-mesh で自動的に張られる
-- v6 peer: SRv6 dataplane 自体は v6 underlay なので、control plane も v6 で peer しておくと transport を揃えられる
-- 両方 Established になっていれば、mp-bgp で v4/v6 両 AFI の routes を冗長に交換できる
+## 0. infra (DNS / dnf-proxy) の前提
+
+`ryskn.k8s` zone を返す internal DNS server が居ないと、`master-1.ryskn.k8s` や `dnf-proxy.ryskn.k8s` が引けなくて先に進めない。
+
+infra01 (= 192.168.1.6) に:
+- **NSD** で `ryskn.k8s` zone を authoritative に serve (例: `dnf-proxy IN A 192.168.1.6`)
+- **unbound** で recursive resolver、`ryskn.k8s` だけ `127.0.0.1@1053` (= NSD) に stub-zone forward、それ以外は `1.1.1.1` に forward
+- nginx で `/almalinux/`、`/cri-o/` 等を AlmaLinux 公式 mirror から proxy (= ローカル dnf-proxy)
+
+両方が `systemctl enable --now` されてること。**boot 後に自動起動を忘れがち** で、reboot 後に DNS が無くて全部死ぬ。
 
 ## 1. Proxmox VM 作成
 
 Proxmox host で AlmaLinux 10 cloud-init テンプレ (VMID 9001) からクローン:
 
 ```bash
-# master-1
-qm clone 9001 102 --name master-1 --full
-qm set 102 --cores 2 --sockets 1 --cpu host --memory 4096 --balloon 0 \
+# master (VMID 103)
+qm clone 9001 103 --name master --full
+qm set 103 --cores 6 --sockets 1 --cpu host --memory 4096 --balloon 0 \
     --net0 virtio,bridge=vmbr0 --agent enabled=1 --onboot 1
-qm resize 102 scsi0 40G
-qm set 102 --ipconfig0 ip=192.168.1.102/24,gw=192.168.1.1,ip6=auto
-qm set 102 --nameserver 192.168.1.101 --searchdomain ryskn.k8s
+qm resize 103 scsi0 50G
+qm set 103 --ipconfig0 ip=192.168.1.10/24,gw=192.168.1.1,ip6=auto
+qm set 103 --nameserver 192.168.1.6 --searchdomain ryskn.k8s
 
-# worker-1
-qm clone 9001 103 --name worker-1 --full
-qm set 103 --cores 4 --sockets 1 --cpu host --memory 8192 --balloon 0 \
+# worker-1 (VMID 101)
+qm clone 9001 101 --name worker-1 --full
+qm set 101 --cores 6 --sockets 1 --cpu host --memory 6144 --balloon 0 \
     --net0 virtio,bridge=vmbr0 --agent enabled=1 --onboot 1
-qm resize 103 scsi0 60G
-qm set 103 --ipconfig0 ip=192.168.1.103/24,gw=192.168.1.1,ip6=auto
-qm set 103 --nameserver 192.168.1.101 --searchdomain ryskn.k8s
+qm resize 101 scsi0 50G
+qm set 101 --ipconfig0 ip=192.168.1.11/24,gw=192.168.1.1,ip6=auto
+qm set 101 --nameserver 192.168.1.6 --searchdomain ryskn.k8s
 
-# worker-2 も同様 (VMID 104, IP 192.168.1.104)
+# worker-2 (VMID 102) も同様 (ip=192.168.1.12)
 
-qm start 102 && qm start 103 && qm start 104
+qm start 103 && qm start 101 && qm start 102
 ```
 
 ## 2. Proxmox vmbr0 の multicast snooping を無効化
 
-**これが最大のハマりどころ**。Proxmox のデフォルト設定では vmbr0 に `multicast_snooping=1` が有効かつ multicast querier が居ないため、VM 間で IPv6 の Neighbor Solicitation (`ff02::1:ff…`) が flood されない。VPP は SRv6 encap 後のパケットを uplink global v6 宛に投げようとするが ND が解決できず、物理線に一切出ないまま詰まる。
-
-Proxmox host で:
+**最大級のハマりどころ**。Proxmox のデフォルト設定では vmbr0 に `multicast_snooping=1` が有効かつ multicast querier が居ないため、VM 間で IPv6 の Neighbor Solicitation (`ff02::1:ff…`) が flood されない。VPP は SRv6 encap 後のパケットを uplink global v6 宛に投げようとするが ND が解決できず、物理線に一切出ないまま詰まる。
 
 ```bash
-# 確認 (デフォルトは 1 / 0)
+# 確認 (デフォルトは 1)
 cat /sys/class/net/vmbr0/bridge/multicast_snooping
-cat /sys/class/net/vmbr0/bridge/multicast_querier
 
 # 即効適用
 echo 0 > /sys/class/net/vmbr0/bridge/multicast_snooping
@@ -76,41 +87,104 @@ echo 0 > /sys/class/net/vmbr0/bridge/multicast_snooping
 #   post-up echo 0 > /sys/class/net/vmbr0/bridge/multicast_snooping
 ```
 
-適用後、ノード間の ND が解けるようになる。構築完了してから「Pod-to-Pod が片方向だけ動く」みたいな怪奇現象に出くわしたらまずここを疑う。
+## 3. AlmaLinux cloud-init の罠 (3 つ)
 
-## 3. 全ノード共通の下準備
+**今回最も悩まされた**。AlmaLinux cloud-init テンプレを使うと、reboot のたびに以下が re-set される:
 
-各ノード (master + worker×2) に root で SSH して実行:
+### 3-1. `manage_etc_hosts: True` で `/etc/hosts` が再生成される
+
+`fd00:1::10 master-1.ryskn.k8s` 等の手動エントリが boot 毎に消える。
+
+**対処**: `/etc/cloud/cloud.cfg` で `manage_etc_hosts: false` に。
+
+### 3-2. `/etc/sysconfig/kubelet` が空に reset される
+
+`KUBELET_EXTRA_ARGS=--node-ip=fd00:1::10 ...` が空に書き換えられて、kubelet が IPv4 の InternalIP で再 register される (= cluster の v6 single-stack 設計と矛盾)。
+
+**対処**: `chattr +i /etc/sysconfig/kubelet` で immutable に。
+
+### 3-3. NetworkManager が `/etc/resolv.conf` を再生成
+
+`nameserver 192.168.1.6` (内部 DNS) を書いても消えて、結果 `dnf-proxy.ryskn.k8s` が引けなくて全 install が死ぬ。
+
+**対処**: `chattr +i /etc/resolv.conf` で immutable に。
+
+## 4. 全ノード共通の下準備
+
+各ノード (master + worker×2) に root で SSH (ユーザー名 `ryosuke`、`sudo bash` で実行):
 
 ```bash
-# ローカルリポジトリ追加
-cat > /etc/yum.repos.d/local-extra.repo <<EOF
-[local-cri-o]
-name=Local cri-o 1.35
-baseurl=http://local.repo.ryskn.k8s/cri-o/1.35/
+# === [0/6] kubernetes / cri-o repos (公式 pkgs.k8s.io) ===
+# kubernetes 1.36 / cri-o 1.32 stable. cri-o 1.33+ は stable 未公開で 1.32 に揃える
+cat > /etc/yum.repos.d/kubernetes.repo <<EOF
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.36/rpm/
 enabled=1
-gpgcheck=0
-
-[local-kubernetes]
-name=Local Kubernetes 1.35
-baseurl=http://local.repo.ryskn.k8s/kubernetes/1.35/
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.36/rpm/repodata/repomd.xml.key
+EOF
+cat > /etc/yum.repos.d/cri-o.repo <<EOF
+[cri-o]
+name=CRI-O
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.32/rpm/
 enabled=1
-gpgcheck=0
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.32/rpm/repodata/repomd.xml.key
 EOF
 dnf clean all && dnf makecache
 
-# DNS
-printf "nameserver 192.168.1.101\nsearch ryskn.k8s\n" > /etc/resolv.conf
+# === [0.5/6] DNS (chattr +i で固定) ===
+chattr -i /etc/resolv.conf 2>/dev/null || true
+printf "nameserver 192.168.1.6\nsearch ryskn.k8s\n" > /etc/resolv.conf
+chattr +i /etc/resolv.conf
 
-# swap off
-swapoff -a
-sed -i '/swap/s/^/#/' /etc/fstab
+# === [0.6/6] eth0 に ULA IPv6 を追加 ===
+# IPv6 single-stack k8s で apiserver は v6 IP に bind する必要があり、
+# Proxmox の SLAAC v6 (240b::/64) は VPP に取られるので、各ノードに静的 ULA を追加。
+HOST_LAST_OCTET=$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d. -f4 | cut -d/ -f1)
+ULA_ADDR="fd00:1::${HOST_LAST_OCTET}/64"
+NM_CONN=$(nmcli -g NAME,DEVICE con show --active | awk -F: '$2=="eth0"{print $1; exit}')
+nmcli con mod "$NM_CONN" +ipv6.addresses "$ULA_ADDR"
+nmcli con mod "$NM_CONN" ipv6.method auto
+nmcli con up "$NM_CONN"
 
-# SELinux permissive
+# === [0.7/6] /etc/hosts (cloud-init 干渉を disable) ===
+sed -i 's/^manage_etc_hosts:.*/manage_etc_hosts: false/' /etc/cloud/cloud.cfg
+grep -q '^manage_etc_hosts:' /etc/cloud/cloud.cfg || \
+    echo 'manage_etc_hosts: false' >> /etc/cloud/cloud.cfg
+sed -i '/ryskn.k8s$/d' /etc/hosts
+cat >> /etc/hosts <<EOF
+fd00:1::10 master-1.ryskn.k8s
+fd00:1::11 worker-1.ryskn.k8s
+fd00:1::12 worker-2.ryskn.k8s
+EOF
+
+# === [0.8/6] v6 Service CIDR の dummy route ===
+# kube-proxy DNAT が OUTPUT chain で動くために必要
+ip -6 route replace fd30::/108 dev lo
+cat > /etc/systemd/system/k8s-v6-service-route.service <<EOF
+[Unit]
+Description=Add dummy v6 route for k8s Service CIDR
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/sbin/ip -6 route replace fd30::/108 dev lo
+RemainAfterExit=true
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now k8s-v6-service-route.service
+
+# === [1/6] swap off ===
+swapoff -a && sed -i '/swap/s/^/#/' /etc/fstab
+
+# === [2/6] SELinux permissive ===
 setenforce 0
 sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
 
-# カーネルモジュール (br_netfilter は kernel-modules-extra に含まれる)
+# === [3/6] kernel modules ===
 dnf install -y kernel-modules-extra
 cat > /etc/modules-load.d/k8s.conf <<EOF
 overlay
@@ -122,7 +196,7 @@ uio_pci_generic
 EOF
 modprobe overlay br_netfilter vfio-pci uio_pci_generic
 
-# sysctl
+# === [4/6] sysctl + hugepages ===
 cat > /etc/sysctl.d/k8s.conf <<EOF
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
@@ -132,78 +206,88 @@ net.ipv4.conf.all.rp_filter         = 0
 net.ipv4.conf.default.rp_filter     = 0
 net.ipv4.conf.eth0.rp_filter        = 0
 EOF
-
-# hugepages (VPP が 512 MB 要求するので倍取る)
 cat > /etc/sysctl.d/hugepages.conf <<EOF
 vm.nr_hugepages = 512
 EOF
 sysctl --system
 
-# cri-o
+# === [5/6] cri-o ===
 dnf install -y cri-o
 systemctl enable --now crio
 
-# kubeadm/kubelet/kubectl
-dnf install -y kubeadm kubelet kubectl podman
-mkdir -p /etc/systemd/system/kubelet.service.d
-cat > /etc/systemd/system/kubelet.service.d/20-crio.conf <<EOF
-[Service]
-Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/crio/crio.sock"
+# === [6/6] kubeadm / kubelet / kubectl + cloud-init 干渉防止 ===
+dnf install -y kubeadm kubelet kubectl
+
+NODE_ULA="fd00:1::${HOST_LAST_OCTET}"
+chattr -i /etc/sysconfig/kubelet 2>/dev/null || true
+cat > /etc/sysconfig/kubelet <<EOF
+KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/crio/crio.sock --node-ip=${NODE_ULA}
 EOF
-systemctl daemon-reload
-systemctl enable kubelet
+chattr +i /etc/sysconfig/kubelet  # cloud-init で空に書き換えられるのを防ぐ
+
+systemctl daemon-reload && systemctl enable kubelet
 ```
 
-## 4. master 初期化
+:::message
+**`KUBELET_EXTRA_ARGS` を `/etc/systemd/system/kubelet.service.d/20-crio.conf` の `Environment=` ではなく `/etc/sysconfig/kubelet` に書く**。kubeadm の標準 drop-in (`/usr/lib/.../10-kubeadm.conf`) が `EnvironmentFile=-/etc/sysconfig/kubelet` を読んでて、こちらの値が drop-in の `Environment=` を上書きするため。drop-in に書いても効かない。
+:::
 
-master (192.168.1.102) で:
+## 5. master 初期化
+
+master (192.168.1.10) で:
 
 ```bash
-kubeadm init \
+sudo kubeadm init \
     --cri-socket=unix:///var/run/crio/crio.sock \
-    --pod-network-cidr=172.16.0.0/16,fd20::/64 \
-    --service-cidr=10.96.0.0/12,fd30::/108 \
+    --apiserver-advertise-address=fd00:1::10 \
+    --pod-network-cidr=fd20::/64 \
+    --service-cidr=fd30::/108 \
     --control-plane-endpoint=master-1.ryskn.k8s
 
-mkdir -p ~/.kube
-cp -f /etc/kubernetes/admin.conf ~/.kube/config
+# kubeconfig (root + ryosuke 両方)
+mkdir -p /root/.kube && cp -f /etc/kubernetes/admin.conf /root/.kube/config
+mkdir -p /home/ryosuke/.kube && cp -f /etc/kubernetes/admin.conf /home/ryosuke/.kube/config
+chown -R ryosuke:ryosuke /home/ryosuke/.kube
 
-kubeadm token create --print-join-command > /root/k8s-join.sh
+sudo kubeadm token create --print-join-command > /home/ryosuke/k8s-join.sh
+chown ryosuke:ryosuke /home/ryosuke/k8s-join.sh
 ```
 
-dual-stack CIDR で init する (apiserver の bind 互換のため)。Pod 割当を v6 に絞るのは後の Installation CR で行う。
+## 6. worker join
 
-## 5. worker join
-
-各 worker で master が出力した join コマンドを実行:
+各 worker で:
 
 ```bash
-kubeadm join master-1.ryskn.k8s:6443 \
-    --token <TOKEN> \
-    --discovery-token-ca-cert-hash sha256:<HASH> \
-    --cri-socket=unix:///var/run/crio/crio.sock
+JOIN_CMD=$(ssh ryosuke@192.168.1.10 'cat ~/k8s-join.sh')
+sudo bash -c "$JOIN_CMD --cri-socket=unix:///var/run/crio/crio.sock"
 ```
 
-## 6. tigera-operator と Installation CR (v6 IPPool のみ明示)
+確認:
+
+```bash
+kubectl get nodes -o wide
+# NAME                 STATUS     INTERNAL-IP   VERSION
+# master.ryskn.k8s     Ready      fd00:1::10    v1.36.0
+# worker-1.ryskn.k8s   NotReady   fd00:1::11    v1.36.0
+# worker-2.ryskn.k8s   NotReady   fd00:1::12    v1.36.0
+```
+
+`NotReady` は CNI 未 install で正常 (= 次の section で直る)。InternalIP が **v6** になってれば `chattr +i /etc/sysconfig/kubelet` が効いてる証拠。
+
+## 7. tigera-operator + Calico Installation (v3.32.0)
 
 master で:
 
 ```bash
-# CRD (annotation サイズ大のため server-side)
-curl -sLO https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/operator-crds.yaml
-kubectl apply --server-side -f operator-crds.yaml
-
-# operator 本体
-curl -sLO https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/tigera-operator.yaml
-kubectl apply --server-side -f tigera-operator.yaml
+# operator-crds + tigera-operator (v3.32.0)
+kubectl apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/operator-crds.yaml
+kubectl apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/tigera-operator.yaml
 kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
 
 until kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; do sleep 5; done
 ```
 
-**ここが 2 つめのハマりどころ**。Installation CR で `ipPools` を明示しないと、tigera-operator は kubeadm の `pod-network-cidr` を見て `default-ipv4-ippool` と `default-ipv6-ippool` を勝手に作る。dual-stack CIDR で init しているので v4 pool まで生えて、Pod が v4 で割り当てられてしまう。
-
-v6 pool のみを **明示的に** 列挙する:
+Installation CR を **v6 ipPools のみ明示** で apply (= operator が v4 pool を勝手に作るのを抑止):
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -230,17 +314,11 @@ spec: {}
 EOF
 ```
 
-ipPools を省略した spec で apply してしまった後でこれを上書きしても、operator は v4 pool を即座には消さない。既に作られてたら明示削除する:
+## 8. Calico-VPP マニフェスト (kustomize)
 
-```bash
-kubectl delete ippool default-ipv4-ippool
-```
+リポジトリの `yaml/overlays/` に自前 overlay を作る。base は `test-vagrant` (= 公式の汎用 base)。
 
-## 7. Calico-VPP マニフェスト (kustomize)
-
-リポジトリの `yaml/overlays/dev-ryskn-srv6/` (あるいは自分の overlay ディレクトリ) に以下を配置する。
-
-### 7-1. kustomization.yaml
+### 8-1. kustomization.yaml
 
 ```yaml
 bases:
@@ -254,7 +332,7 @@ patchesStrategicMerge:
 - image-patch.yaml
 ```
 
-### 7-2. config-patch.yaml (VPP uplink 設定)
+### 8-2. config-patch.yaml (VPP uplink)
 
 ```yaml
 kind: ConfigMap
@@ -280,9 +358,34 @@ data:
     }
 ```
 
-### 7-3. srv6res-patch.yaml (IPPool v6 のみ)
+### 8-3. srv6-cm-patch.yaml (SRv6 機能 ON + Service CIDR を v6 に)
 
-LocalSID プールはノード名で厳密にマッチさせる (`sr-localsids-pool-<hostname>`)。Calico-VPP agent がこの命名規約でプールを検索している。
+```yaml
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: calico-vpp-config
+  namespace: calico-vpp-dataplane
+data:
+  SERVICE_PREFIX: "fd30::/108"
+  CALICOVPP_DEBUG: |-
+    { "gsoEnabled": false }
+  CALICOVPP_SRV6: |-
+    {
+      "policyPool": "cafe::/118",
+      "localsidPool": "fcff::/48"
+    }
+  CALICOVPP_FEATURE_GATES: |-
+    { "srv6Enabled": true }
+```
+
+:::message alert
+**`SERVICE_PREFIX` をデフォルト (`10.96.0.0/12`) のままにしないこと**。v6 single-stack で apiserver Service IP は `fd30::1` なので、cnat が DNAT を解決できなくて kubelet が apiserver に到達できない。今回の cluster ではこれで丸 1 日溶かした。
+:::
+
+### 8-4. srv6res-patch.yaml (LocalSID プール)
+
+LocalSID プールはノード名で厳密にマッチさせる (`sr-localsids-pool-<hostname>`)。Calico-VPP agent はこの命名規約でプールを検索する。
 
 ```yaml
 apiVersion: v1
@@ -311,11 +414,11 @@ items:
 - apiVersion: crd.projectcalico.org/v1
   kind: IPPool
   metadata:
-    name: sr-localsids-pool-master-1.ryskn.k8s
+    name: sr-localsids-pool-master.ryskn.k8s
   spec:
     cidr: fcff:0:0:00AA::/64
     ipipMode: Never
-    nodeSelector: kubernetes.io/hostname == 'master-1.ryskn.k8s'
+    nodeSelector: kubernetes.io/hostname == 'master.ryskn.k8s'
     vxlanMode: Never
 - apiVersion: crd.projectcalico.org/v1
   kind: IPPool
@@ -337,7 +440,7 @@ items:
     vxlanMode: Never
 ```
 
-### 7-4. rbac-patch.yaml (ipreservations 権限を追加)
+### 8-5. rbac-patch.yaml (ipreservations 権限)
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -363,9 +466,7 @@ subjects:
   namespace: calico-vpp-dataplane
 ```
 
-### 7-5. image-patch.yaml (fix 入り image を指定)
-
-PR #973 と PR #982 の fix を両方含んだ image を GHCR に push 済みなので、それを直接 pull する。tag は commit SHA を使う:
+### 8-6. image-patch.yaml (公式 v3.32.0 image を指定)
 
 ```yaml
 apiVersion: apps/v1
@@ -378,203 +479,89 @@ spec:
     spec:
       containers:
       - name: vpp
-        image: ghcr.io/ryskn/calicovpp/vpp:beb8ef38bcacae9caa4369d514c637587ca5ac28
+        image: docker.io/calicovpp/vpp:v3.32.0
         imagePullPolicy: IfNotPresent
       - name: agent
-        image: ghcr.io/ryskn/calicovpp/agent:beb8ef38bcacae9caa4369d514c637587ca5ac28
+        image: docker.io/calicovpp/agent:v3.32.0
         imagePullPolicy: IfNotPresent
 ```
 
-この image に含まれている fix:
+:::message
+**v3.32.0 公式 image** で動く。以前は SRv6 install 周りの 3 件のバグ ([PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)) と cnat ENOENT ([PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982) + [VPP gerrit #45604](https://gerrit.fd.io/r/c/vpp/+/45604)) があり fork build が必要だったが、v3.32.0 で全て merged 済。
+:::
 
-- **[PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)** (merged): SR Policy install を直す 3 件 — BSID の `anypb.Any` 2 段 Unmarshal、SR Policy SAFI (`85`) を受け付けるよう条件修正、`injectRoute` fallback の抑止
-- **[PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982)** (open): IPv6 single-stack で発生する cnat SNAT の ENOENT idempotency 問題のガード。`cnat_snat_policy_add_del_if(is_add=false)` が一度も add されていない family (= INCLUDE_V4 が空) で発火すると VPP API が `-6 No such entry` を返し、agent の reconcile loop が `dying` に入るのを防ぐ
-  - 根本修正は VPP 側で対応済み ([gerrit Change 45604](https://gerrit.fd.io/r/c/vpp/+/45604))。これがリリースに入るまでの暫定 guard
-
-multi-arch (amd64 / arm64) で push してあるので、x86 / ARM 両方の cluster で同じ tag を使える。
-
-### 7-6. 生成と適用
+### 8-7. 生成と適用
 
 ```bash
 kubectl kustomize yaml/overlays/dev-ryskn-srv6 > calico-vpp-srv6.yaml
 kubectl apply -f calico-vpp-srv6.yaml
 ```
 
-## 8. fix 入り VPP / Agent image を入手する
-
-7-5 で指定した image は **公式 release (v3.31.x) ではなく** PR #973 + PR #982 を当てたもの。release 版には SRv6 dataplane の不具合 3 件 (BSID の 2 段 Unmarshal / SAFI `85` 未対応 / `injectRoute` fallback の干渉) と、IPv6 single-stack で agent を巻き込む cnat ENOENT があるため、そのままだと SR Policy が install されないか、再起動時に agent が落ちる。
-
-入手方法は 2 つある。
-
-### 8-a. GHCR から pull する (推奨)
-
-7-5 の `image-patch.yaml` に書いた tag をそのまま使う。各ノードに事前 pull したい場合:
-
-```bash
-for h in 192.168.1.102 192.168.1.103 192.168.1.104; do
-    ssh root@$h '
-        podman pull ghcr.io/ryskn/calicovpp/vpp:beb8ef38bcacae9caa4369d514c637587ca5ac28
-        podman pull ghcr.io/ryskn/calicovpp/agent:beb8ef38bcacae9caa4369d514c637587ca5ac28
-    '
-done
-```
-
-`imagePullPolicy: IfNotPresent` にしているので、最初の Pod 起動時に kubelet が pull する。pre-pull はオフライン耐性が欲しいときだけで OK。
-
-GHCR public で配布しているので auth は不要。private にした場合は `imagePullSecret` を `calico-vpp-dataplane` namespace に置く必要がある。
-
-### 8-b. 自前で master ブランチからビルドする (代替)
-
-自分で fix を当て直したい / patch を変えたい場合はこちら。
-
-```bash
-git clone https://github.com/projectcalico/vpp-dataplane.git
-cd vpp-dataplane
-# PR #982 を取り込む (まだ未 merge なので必要)
-git fetch origin pull/982/head:pr982
-git merge --no-edit pr982
-
-make -C vpp-manager vpp-image TAG=srv6-fix
-make -C calico-vpp-agent image TAG=srv6-fix
-```
-
-成果物 (`calicovpp/vpp:srv6-fix` / `calicovpp/agent:srv6-fix`) を tarball で配布:
-
-```bash
-podman save -o /tmp/calicovpp-vpp-srv6-fix.tar calicovpp/vpp:srv6-fix
-podman save -o /tmp/calicovpp-agent-srv6-fix.tar calicovpp/agent:srv6-fix
-
-for h in 192.168.1.102 192.168.1.103 192.168.1.104; do
-    scp /tmp/calicovpp-*-srv6-fix.tar root@$h:/tmp/
-    ssh root@$h '
-        podman load -i /tmp/calicovpp-vpp-srv6-fix.tar
-        podman load -i /tmp/calicovpp-agent-srv6-fix.tar
-    '
-done
-```
-
-この場合は 7-5 の `image-patch.yaml` を `image: calicovpp/vpp:srv6-fix` / `imagePullPolicy: Never` に書き戻す。
-
-## 9. Calico 本体 image の配布
-
-VPP 以外の Calico コンポーネント (node / typha / kube-controllers / apiserver / csi / tigera-operator) は公式 release で問題ないので、全ノードに普通にロードする:
-
-```bash
-for t in tigera-operator-v1.40.7 calico-node-v3.31.4 calico-cni-v3.31.4 \
-         calico-typha-v3.31.4 calico-kube-controllers-v3.31.4 \
-         calico-apiserver-v3.31.4 calico-csi-v3.31.4 \
-         calico-node-driver-registrar-v3.31.4; do
-    curl -fsSLO http://local.repo.ryskn.k8s/k8s-images/${t}.tar
-    podman load -i ${t}.tar
-done
-```
-
-タグが落ちる場合は `podman tag <SHA> docker.io/calico/node:v3.31.4` のように付け直す。
-
-## 10. 動作確認
+## 9. 動作確認
 
 ```bash
 # ノード Ready
 kubectl get nodes -o wide
-# INTERNAL-IP 列は v4 で OK (node IP は v4 のまま、Pod/Service が v6)
+# NAME                 STATUS  INTERNAL-IP
+# master.ryskn.k8s     Ready   fd00:1::10
+# worker-1.ryskn.k8s   Ready   fd00:1::11
+# worker-2.ryskn.k8s   Ready   fd00:1::12
 
-# Calico-VPP DaemonSet が 2/2 Running、image が :srv6-fix
+# Calico-VPP DaemonSet が 2/2 Running、image が v3.32.0
 kubectl -n calico-vpp-dataplane get ds calico-vpp-node -o wide
 
-# IPPool: default-ipv6-ippool + sr-policies-pool + sr-localsids-pool-* のみ
-kubectl get ippool
+# Pod IP が SRv6 LocalSID プール (fcff:0:0:<node>AA::/64) から取れてる
+kubectl get pods -A -o wide | grep -E "fcff::|fd20::"
 ```
 
-Pod を 2 ノードに作って疎通を確認する:
+Pod を 2 ノードに作って疎通:
 
 ```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: test-w1
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: worker-1.ryskn.k8s
-  containers:
-  - name: test
-    image: docker.io/library/busybox:latest
-    imagePullPolicy: IfNotPresent
-    command: ["sleep", "3600"]
-    securityContext:
-      runAsUser: 0
-      capabilities:
-        add: ["NET_RAW", "NET_ADMIN"]
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: test-w2
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: worker-2.ryskn.k8s
-  containers:
-  - name: test
-    image: docker.io/library/busybox:latest
-    imagePullPolicy: IfNotPresent
-    command: ["sleep", "3600"]
-    securityContext:
-      runAsUser: 0
-      capabilities:
-        add: ["NET_RAW", "NET_ADMIN"]
-EOF
+kubectl run test-w1 --image=busybox \
+    --overrides='{"apiVersion":"v1","spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-1.ryskn.k8s"}}}' \
+    -- sleep 3600
+kubectl run test-w2 --image=busybox \
+    --overrides='{"apiVersion":"v1","spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-2.ryskn.k8s"}}}' \
+    -- sleep 3600
 
-kubectl get pods -o wide
-```
-
-Pod IP が `fcff::11aa:…` / `fcff::12aa:…` のように **各ノードの LocalSID プールから v6 で割り当てられている** ことを確認する。これは Calico-VPP SRv6 の設計で、Pod IP 自体が End.DT6 SID になっている。
-
-ping と TCP を通す:
-
-```bash
-# worker-1 pod → worker-2 pod
-kubectl exec test-w1 -- ping -c 5 <test-w2 の v6 IP>
-
-# TCP 疎通
-kubectl exec test-w2 -- sh -c "nohup nc -l -p 8080 -e /bin/date > /tmp/nc.log 2>&1 &"
-sleep 1
-kubectl exec test-w1 -- nc -w 3 <test-w2 の v6 IP> 8080
+W2_IP=$(kubectl get pod test-w2 -o jsonpath='{.status.podIP}')
+kubectl exec test-w1 -- ping -c 5 "$W2_IP"
 ```
 
 VPP の SR 状態:
 
 ```bash
 VPP=$(kubectl -n calico-vpp-dataplane get pod -l k8s-app=calico-vpp-node -o wide \
-      | grep master-1 | awk '{print $1}')
+      | awk '/master/ {print $1; exit}')
 
 kubectl -n calico-vpp-dataplane exec -i $VPP -c vpp -- vppctl show sr policies
 kubectl -n calico-vpp-dataplane exec -i $VPP -c vpp -- vppctl show sr steering-policies
 kubectl -n calico-vpp-dataplane exec -i $VPP -c vpp -- vppctl show sr localsids
-
-# BGP peer
 kubectl -n calico-vpp-dataplane exec -i $VPP -c agent -- gobgp neighbor
 ```
 
-正常時の出力:
-
-- SR policies: ノード数 × 2 (v4/v6) の BSID (`cafe::…`) + Segment Lists がインストール済み
-- SR steering: Pod CIDR (v4/v6 両方) → BSID の steering
-- LocalSID: `DT4` と `DT6` の End SID が 1 つずつ、Good traffic counter が増えていく
-- BGP: **v4 peer と v6 peer の両方が `Establ`**。ここが両方 Up していれば冗長化成立
+正常時:
+- SR policies: ノード数 × 2 (v4/v6) の BSID (`cafe::…`) + Segment Lists がインストール済
+- SR steering: Pod CIDR → BSID の steering
+- LocalSID: `DT4` と `DT6` の End SID、Good traffic counter が増えていく
 
 ## まとめ
 
-- kubeadm は dual-stack CIDR で init する (apiserver の bind 互換のため)
-- 実際の Pod 割当は Installation CR の `ipPools` を v6 のみに明示して絞る。省略すると operator が v4 pool を自動生成する
-- Pod IP は `fd20::/64` ではなく `fcff:0:0:<node>AA::/64` の LocalSID プールから割当される。これが SRv6 の native な設計 (Pod IP = End.DT6 SID)
-- BGP peer は node IP (v4) 経由の auto-mesh + VPP uplink の global v6 経由の両方が張られ、片方が落ちても経路配布が継続する
-- Proxmox vmbr0 の `multicast_snooping=1` は必ず落とす。落とさないと IPv6 ND が解けず、SRv6 encap 後のパケットが物理線に出ない
-- master ブランチの code ([PR #973](https://github.com/projectcalico/vpp-dataplane/pull/973)) + cnat ENOENT guard ([PR #982](https://github.com/projectcalico/vpp-dataplane/pull/982)) を当てた image を使う。release 版では SR Policy のインストールが壊れているのに加え、v6 single-stack だと agent が `cnat_snat_policy_add_del_if` の ENOENT で reconcile loop ごと落ちる
+- **v3.32.0 公式 image** で動く (PR #973 + #982 + VPP gerrit 45604 全部 merged 済、fork build 不要)
+- IPv6 single-stack で kubeadm init は **v6 advertise / v6 CIDR で OK** (= 旧版で必要だった dual-stack 経由は不要に)
+- Pod IP は `fd20::/64` ではなく `fcff:0:0:<node>AA::/64` の LocalSID プールから割当 (= Pod IP = End.DT6 SID、SRv6 native 設計)
+- **AlmaLinux cloud-init の罠 3 点**:
+  - `manage_etc_hosts: false` で `/etc/hosts` を毎回 reset させない
+  - `chattr +i /etc/sysconfig/kubelet` で `--node-ip=fd00:1::*` を保護
+  - `chattr +i /etc/resolv.conf` で内部 DNS を保護
+- **Proxmox vmbr0 の `multicast_snooping=1` は必ず落とす**。落とさないと IPv6 ND が解けず物理線に出ない
+- **Service CIDR を `fd30::/108` に明示**。default の `10.96.0.0/12` のままだと cnat DNAT が解決できず kubelet が apiserver 不通
+- 内部 DNS (NSD + unbound) と dnf-proxy が boot 後 auto-start されてること。reboot 後に DNS が起動失敗してると全 install が連鎖死亡
 
 ---
 
-PR / Change:
+PR / Change (= v3.32.0 に取り込み済の経緯):
 
-- [projectcalico/vpp-dataplane#973](https://github.com/projectcalico/vpp-dataplane/pull/973) (merged) — SR Policy 受信周りの 3 件
-- [projectcalico/vpp-dataplane#982](https://github.com/projectcalico/vpp-dataplane/pull/982) — cnat SNAT ENOENT idempotent guard (暫定)
-- [VPP gerrit Change 45604](https://gerrit.fd.io/r/c/vpp/+/45604) — `cnat_snat_policy_entry` を `pool_get_zero` 直後に init して del-only 系列でも ENOENT を返さないようにする根本修正
+- [projectcalico/vpp-dataplane#973](https://github.com/projectcalico/vpp-dataplane/pull/973) — SR Policy 受信周りの 3 件 (BSID 2 段 Unmarshal / SAFI 85 / injectRoute fallback)
+- [projectcalico/vpp-dataplane#982](https://github.com/projectcalico/vpp-dataplane/pull/982) — cnat SNAT ENOENT idempotent guard (= 暫定 Go 側 guard、根本修正は VPP 側)
+- [VPP gerrit Change 45604](https://gerrit.fd.io/r/c/vpp/+/45604) — `cnat_snat_policy` の del path を re-entrant に。`pool_get_zero` 直後の lazy init を維持しつつ、del-only 系列でも ENOENT を返さないように
